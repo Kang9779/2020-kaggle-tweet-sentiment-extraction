@@ -20,12 +20,13 @@ class config:
     N_FOLDS = 5
     MAX_LEN = 86
     EPOCHS = 3
+    HIDDEN_SIZE = 768
     LEARNING_RATE = 0.2 * 3e-5
     TRAIN_BATCH_SIZE = 16
     VALID_BATCH_SIZE = 8
-    TRAINING_FILE = "./data/train.csv"
+    TRAINING_FILE = "./data/train_folds.csv"
     ROBERTA_PATH = "./torch-roberta"
-    MODEL_SAVE_PATH = './torch-roberta-model'
+    MODEL_SAVE_PATH = './roberta-model'
     TOKENIZER = tokenizers.ByteLevelBPETokenizer(
         vocab=f"{ROBERTA_PATH}/vocab.json", 
         merges=f"{ROBERTA_PATH}/merges.txt", 
@@ -42,11 +43,6 @@ class config:
     USE_SWA = False
     SWA_RATIO = 0.9
     SWA_FREQ = 30
-    
-
-
-# In[15]:
-
 
 def process_data(tweet, selected_text, sentiment, tokenizer, max_len):
     tweet = " " + " ".join(str(tweet).split())
@@ -148,38 +144,42 @@ class TweetDataset:
         }
 
 
-# In[16]:
-
-
 class TweetModel(transformers.BertPreTrainedModel):
     def __init__(self, conf):
         super(TweetModel, self).__init__(conf)
-        self.roberta = RobertaModel.from_pretrained(config.ROBERTA_PATH, config=conf)
-        self.drop_out = torch.nn.Dropout(0.1)
-        self.l0 = torch.nn.Linear(768 * 2, 2)
-        torch.nn.init.normal_(self.l0.weight, std=0.02)
-    
-    def forward(self, ids, mask, token_type_ids):
-        _, _, out = self.roberta(
-            ids,
-            attention_mask=mask,
-            token_type_ids=token_type_ids
-        )
+        self.roberta = RobertaModel.from_pretrained(
+            config.ROBERTA_PATH,
+            config=conf)
+        self.high_dropout = torch.nn.Dropout(config.HIGH_DROPOUT)
+        self.classifier = torch.nn.Linear(config.HIDDEN_SIZE * 2, 2)
 
-        out = torch.cat((out[-1], out[-2]), dim=-1)
-        out = self.drop_out(out)
-        logits = self.l0(out)
+        torch.nn.init.normal_(self.classifier.weight, std=0.02)
+
+    def forward(self, ids, mask, token_type_ids):
+        # sequence_output of N_LAST_HIDDEN + Embedding states
+        # (N_LAST_HIDDEN + 1, batch_size, num_tokens, 768)
+        _, _, out = self.roberta(ids, attention_mask=mask,
+                                 token_type_ids=token_type_ids)
+
+        out = torch.stack(
+            tuple(out[-i - 1] for i in range(config.N_LAST_HIDDEN)), dim=0)
+        out_mean = torch.mean(out, dim=0)
+        out_max, _ = torch.max(out, dim=0)
+        out = torch.cat((out_mean, out_max), dim=-1)
+
+        # Multisample Dropout: https://arxiv.org/abs/1905.09788
+        logits = torch.mean(torch.stack([
+            self.classifier(self.high_dropout(out))
+            for _ in range(5)
+        ], dim=0), dim=0)
 
         start_logits, end_logits = logits.split(1, dim=-1)
 
+        # (batch_size, num_tokens)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
 
-        return start_logits, end_logits
-
-
-# In[17]:
-
+        return start_logits,end_logits
 
 def loss_fn(start_logits, end_logits, start_positions, end_positions):
     """
@@ -207,8 +207,8 @@ def train_fn(data_loader, model, optimizer, device, scheduler=None):
         ids = ids.to(device, dtype=torch.long)
         token_type_ids = token_type_ids.to(device, dtype=torch.long)
         mask = mask.to(device, dtype=torch.long)
-        start_labels = start_labels.to(device, dtype=torch.float)
-        end_labels = end_labels.to(device, dtype=torch.float)
+        start_labels = start_labels.to(device, dtype=torch.long)
+        end_labels = end_labels.to(device, dtype=torch.long)
 
         model.zero_grad()
         outputs_start, outputs_end = model(ids=ids, mask=mask, token_type_ids=token_type_ids)
@@ -220,9 +220,6 @@ def train_fn(data_loader, model, optimizer, device, scheduler=None):
 
         losses.update(loss.item(), ids.size(0))
         tk0.set_postfix(loss=losses.avg)
-
-
-# In[18]:
 
 
 def calculate_jaccard_score(
@@ -303,10 +300,8 @@ def eval_fn(data_loader, model, device):
 def run(fold):
     dfx = pd.read_csv(config.TRAINING_FILE)
 
-    # df_train = dfx[dfx.kfold != fold].reset_index(drop=True)
-    # df_valid = dfx[dfx.kfold == fold].reset_index(drop=True)
-    df_train = dfx
-    df_valid = dfx
+    df_train = dfx[dfx.kfold != fold].reset_index(drop=True)
+    df_valid = dfx[dfx.kfold == fold].reset_index(drop=True)
 
     train_dataset = TweetDataset(
         tweet=df_train.text.values,
@@ -359,7 +354,7 @@ def run(fold):
         num_warmup_steps=int(num_train_steps * config.WARMUP_RATIO),
         num_training_steps=num_train_steps)
 
-    print(f'Training is starting for fold={fold}')
+    print(f'Training is starting for fold = {fold}')
 
     for epoch in range(config.EPOCHS):
         train_fn(train_data_loader, model, optimizer,device,scheduler=scheduler)

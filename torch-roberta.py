@@ -6,13 +6,12 @@ import numpy as np
 import pandas as pd
 import tokenizers
 import transformers
-from transformers import RobertaModel,RobertaConfig
-from sklearn.model_selection import StratifiedKFold
-from transformers import AdamW
-from transformers import get_linear_schedule_with_warmup
 import torchcontrib
-import tqdm
 import utils
+import tqdm
+from transformers import AdamW
+from transformers import RobertaModel,RobertaConfig
+from transformers import get_linear_schedule_with_warmup
 
 
 class config:
